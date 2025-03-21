@@ -1,3 +1,3 @@
 # illustrate
 
-XORSTR is an util that allow to obfuscation string at compile time.
+This method use dxgi to capture screen, it's fastest mode of hardware capturing with low performance usage.
