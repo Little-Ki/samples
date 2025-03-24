@@ -1,5 +1,8 @@
 # Prerequisites
 *.d
+*.ilk
+*.pdb
+*.zip
 
 # Compiled Object files
 *.slo

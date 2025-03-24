@@ -21,6 +21,35 @@ namespace zipper {
         }
     }
 
+    std::array<uint32_t, 256> generate_crc_table() noexcept {
+
+        auto table = std::array<uint32_t, 256>{};
+        std::generate(table.begin(), table.end(), [n = 0]() mutable {
+            constexpr uint32_t poly = 0xEDB88320;
+            uint32_t t = n++;
+            for (int j = 8; j > 0; j--)
+                t = (t >> 1) ^ ((t & 1) ? poly : 0);
+            return t;
+        });
+
+        return table;
+    }
+
+    uint32_t crc32(const uint8_t *data, size_t size) {
+        static const auto table = generate_crc_table();
+
+        uint32_t crc = 0xFFFFFFFF;
+        while (size--) {
+            crc = ((crc >> 8) & 0x00FFFFFF) ^ table[(crc ^ (*data)) & 0xFF];
+            data++;
+        }
+        return (crc ^ 0xFFFFFFFF);
+    }
+
+    uint32_t crc32(const char *data, size_t size) {
+        return crc32(reinterpret_cast<const uint8_t *>(data), size);
+    }
+
     class ifstream_t : public std::ifstream {
     private:
         size_t _size;
@@ -50,11 +79,11 @@ namespace zipper {
         }
 
         template <typename T>
-        void read(T* buffer, size_t count = 1) {
+        void read(T *buffer, size_t count = 1) {
             auto raw = reinterpret_cast<char *>(buffer);
             std::ifstream::read(raw, sizeof(T) * count);
             if (_use_reverse) {
-                while(count --) {
+                while (count--) {
                     byte_reverse(buffer[count - 1]);
                 }
             }
@@ -83,15 +112,16 @@ namespace zipper {
         template <typename T>
         void write(T value) {
             auto raw = reinterpret_cast<char *>(&value);
-            if (_use_reverse)
+            if (_use_reverse && sizeof(T) > 1)
                 byte_reverse(value);
             std::ofstream::write(raw, sizeof(T));
         }
 
         template <typename T>
-        void write(size_t at, T value) {
-            seekg(at, beg);
-            ofstream_t::write(value);
+        void write_buf(const T *buffer, size_t count = 1) {
+            while (count--) {
+                write(*(buffer++));
+            }
         }
 
         ~ofstream_t() {
@@ -149,6 +179,46 @@ namespace zipper {
         in.read(&result.filename_length);
         in.read(&result.extra_length);
         return result;
+    }
+
+    void write_fh(ofstream_t &out, const ZipFile &file) {
+        out.write(SIG_LOCAL_FILE_HEADER);
+        out.write(file.version_made);
+        out.write(file.bitflags);
+        out.write(file.compression_method);
+        out.write(file.modify_time);
+        out.write(file.modify_date);
+        out.write(file.crc32);
+        out.write(file.compressed_size);
+        out.write(file.uncompressed_size);
+        out.write<uint16_t>(file.file_name.size());
+        out.write<uint16_t>(file.extra_fields.size());
+        if (file.file_name.size())
+            out.write_buf(file.file_name.data(), file.file_name.size());
+        if (file.extra_fields.size())
+            out.write_buf(file.extra_fields.data(), file.extra_fields.size());
+        if (file.data.size())
+            out.write_buf(file.data.data(), file.data.size());
+    }
+
+    void write_cdfh(ofstream_t &out, const ZipFile &file, uint32_t file_offset) {
+        out.write(SIG_CENTRAL_DIRECTORY);
+        out.write(file.version_made);
+        out.write(file.version_extract);
+        out.write(file.bitflags);
+        out.write(file.compression_method);
+        out.write(file.modify_time);
+        out.write(file.modify_date);
+        out.write(file.crc32);
+        out.write(file.compressed_size);
+        out.write(file.uncompressed_size);
+        out.write<uint16_t>(file.file_name.size());
+        out.write<uint16_t>(file.extra_fields.size());
+        out.write<uint16_t>(file.comment.size());
+        out.write<uint16_t>(0);
+        out.write(file.internal_attributes);
+        out.write(file.external_attributes);
+        out.write(file_offset);
     }
 
     size_t find_eocd(ifstream_t &in) {
@@ -258,7 +328,73 @@ namespace zipper {
     }
 
     Error Zipper::save(const std::string &file_name) {
+        ofstream_t out;
+
+        if (!out.try_open(file_name)) {
+            return Error::FileError;
+        }
+
+        std::vector<ZipFile *> files;
+        std::vector<uint32_t> offsets;
+
+        for (auto &f : _files) {
+            files.push_back(&(f.second));
+            offsets.push_back(out.tellp());
+            write_fh(out, f.second);
+        }
+
+        uint32_t cdfh_offset = out.tellp();
+
+        for (auto i = 0; i < files.size(); i++) {
+            write_cdfh(out, *files[i], offsets[i]);
+        }
+
+        uint32_t cdfh_end = out.tellp();
+        uint32_t cdfh_size = cdfh_end - cdfh_offset;
+
+        out.write(SIG_END_CENTRAL_DIRECTORY);
+        out.write<uint16_t>(0);
+        out.write<uint16_t>(0);
+        out.write<uint16_t>(files.size());
+        out.write<uint16_t>(files.size());
+        out.write(cdfh_size);
+        out.write(cdfh_offset);
+        out.write(_comment.size());
+        if (_comment.size())
+            out.write_buf(_comment.data(), _comment.size());
+
         return Error::Success;
+    }
+
+    void Zipper::add(const std::string &file_name, const std::vector<uint8_t> &data) {
+        ZipFile file;
+
+        file.version_made = VERSION_STORE;
+        file.version_extract = VERSION_STORE;
+        file.bitflags = 0;
+        file.compression_method = METHOD_STORE;
+        file.compressed_size = data.size();
+        file.uncompressed_size = data.size();
+        file.modify_date = DATE_NORMAL;
+        file.modify_time = TIME_NORMAL;
+        file.crc32 = crc32(data.data(), data.size());
+        file.internal_attributes = 0;
+        file.external_attributes = 32;
+
+        file.file_name = file_name;
+        file.data = data;
+
+        _files.emplace(file_name, file);
+    }
+
+    void Zipper::add(const std::string &file_name, const std::string &str) {
+        std::vector<uint8_t> data(str.size());
+        std::copy(str.begin(), str.end(), data.begin());
+        add(file_name, data);
+    }
+
+    void Zipper::remove(const std::string &file_name) {
+        _files.erase(file_name);
     }
 
     const std::string &Zipper::comment() {
@@ -273,7 +409,7 @@ namespace zipper {
         return _directory_count;
     }
 
-    void Zipper::set_comment(const std::string& comment) {
+    void Zipper::set_comment(const std::string &comment) {
         _comment = comment;
     }
 }

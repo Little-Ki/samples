@@ -145,13 +145,19 @@ namespace zipper {
 
         Error save(const std::string &file_name);
 
-        void set_comment(const std::string& comment);
+        void add(const std::string &file_name, const std::vector<uint8_t>& data);
+        
+        void add(const std::string &file_name, const std::string& str);
+        
+        void remove(const std::string &file_name);
 
-        const std::string& comment();
+        void set_comment(const std::string &comment);
 
-        const auto& directory_count ();
+        const std::string &comment();
 
-        const auto& file_count ();
+        const auto &directory_count();
+
+        const auto &file_count();
 
     private:
         std::string _comment;
